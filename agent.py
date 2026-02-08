@@ -46,7 +46,7 @@ async def main():
     # потому что мы логинимся как BOT по BOT_TOKEN.
     client = TelegramClient("bot_session", API_ID, API_HASH)
 
-    await client.start(bot_token=BOT_TOKEN)  # <-- КЛЮЧЕВОЕ: никаких телефонов/кодов
+    await client.start(bot_token=os.environ["BOT_TOKEN"])  # <-- КЛЮЧЕВОЕ: никаких телефонов/кодов
     logging.info("Client started OK")
 
     while True:
