@@ -2,139 +2,139 @@ import os
 import json
 import asyncio
 import logging
-from datetime import datetime, timezone
+import shutil
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from telethon import TelegramClient
-from telethon.tl.types import Channel
-from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 
-# ================== ENV ==================
+# -------------------- ENV --------------------
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TZ = os.getenv("TZ", "UTC")
 
-# ================== НАСТРОЙКИ ==================
-DEFAULT_POLL_MINUTES = 10          # как часто запускать (мин)
-MAX_CHATS_TO_SCAN = 200            # сколько каналов/чатов просматривать
-MESSAGES_PER_CHAT = 50             # сколько сообщений брать из каждого
+# ВАЖНО: BOT_TOKEN НЕ ИСПОЛЬЗУЕМ ДЛЯ СКАНА (боту нельзя get_dialogs)
+# BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-OUTPUT_JSON = "posts.json"
-LOG_FILE = "agent.log"
-SESSION_NAME = "hockey_agent"
+# Настройки
+MAX_CHATS_TO_SCAN = int(os.getenv("MAX_CHATS_TO_SCAN", "200"))
+MESSAGES_PER_CHAT = int(os.getenv("MESSAGES_PER_CHAT", "50"))
+OUTPUT_JSON = os.getenv("OUTPUT_JSON", "posts.json")
+POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
 
-# ключевые слова хоккея
+# Имя сессии (должен существовать файл hockey_agent.session)
+SESSION_BASENAME = os.getenv("SESSION_BASENAME", "hockey_agent")
+SESSION_FILE_LOCAL = f"./{SESSION_BASENAME}.session"
+SESSION_FILE_SECRET = f"/etc/secrets/{SESSION_BASENAME}.session"
+
+# Ключевые слова
 HOCKEY_KEYWORDS = [
     "хоккей", "кхл", "вхл", "мхл", "нхл",
-    "hockey", "khl", "vhl", "nhl",
-    "буллит", "плей-офф", "playoff",
-    "вратарь", "звено", "состав", "матч"
+    "hockey", "khl", "vhl", "nhl", "mhl",
+    "ставк", "коэфф", "прогноз", "линия", "тотал", "фора"
 ]
 
-# слова, похожие на ставки / прогнозы
-BET_HINTS = [
-    "ставк", "прогноз", "коэф", "кф",
-    "тотал", "фора", "победа",
-    "1х", "2х", "x2", "over", "under"
-]
-
-# ================== ЛОГИ ==================
+# -------------------- LOGGING --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 log = logging.getLogger("agent")
 
-# ================== УТИЛИТЫ ==================
-def contains_any(text: str, words: list[str]) -> bool:
-    text = text.lower()
-    return any(w in text for w in words)
 
-def load_posts() -> list:
-    if not os.path.exists(OUTPUT_JSON):
-        return []
-    with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
-        return json.load(f)
+def ensure_session_file():
+    """
+    На Render secret file лежит в /etc/secrets/...
+    Мы копируем его в рабочую папку, чтобы Telethon спокойно его увидел.
+    """
+    if os.path.exists(SESSION_FILE_SECRET):
+        if (not os.path.exists(SESSION_FILE_LOCAL)) or (os.path.getsize(SESSION_FILE_LOCAL) != os.path.getsize(SESSION_FILE_SECRET)):
+            shutil.copyfile(SESSION_FILE_SECRET, SESSION_FILE_LOCAL)
+            log.info(f"Session copied from secrets: {SESSION_FILE_SECRET} -> {SESSION_FILE_LOCAL}")
+    else:
+        log.warning(f"Secret session file not found: {SESSION_FILE_SECRET} (если будет EOFError — значит не залил session)")
 
-def save_posts(posts: list):
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(posts, f, ensure_ascii=False, indent=2)
 
-# ================== ОСНОВНАЯ ЛОГИКА ==================
-async def scan(client: TelegramClient):
-    log.info("Начинаем сканирование Telegram")
+def looks_hockey(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in HOCKEY_KEYWORDS)
 
-    posts = load_posts()
-    seen_ids = {p["id"] for p in posts}
+
+async def scan_once(client: TelegramClient):
+    tzinfo = ZoneInfo(TZ)
+    now = datetime.now(tzinfo).isoformat()
+
+    results = {
+        "generated_at": now,
+        "chats_scanned": 0,
+        "matches": []
+    }
 
     dialogs = await client.get_dialogs(limit=MAX_CHATS_TO_SCAN)
+    results["chats_scanned"] = len(dialogs)
 
-    for dialog in dialogs:
-        if not isinstance(dialog.entity, Channel):
-            continue
+    for d in dialogs:
+        entity = d.entity
+        title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(getattr(entity, "id", "unknown"))
 
+        # берём последние сообщения
         try:
-            async for msg in client.iter_messages(
-                dialog.entity,
-                limit=MESSAGES_PER_CHAT
-            ):
-                if not msg.text:
-                    continue
-
-                if msg.id in seen_ids:
-                    continue
-
-                text = msg.text.lower()
-
-                # фильтры
-                if not contains_any(text, HOCKEY_KEYWORDS):
-                    continue
-                if not contains_any(text, BET_HINTS):
-                    continue
-
-                post = {
-                    "id": msg.id,
-                    "chat": dialog.name,
-                    "date": msg.date.astimezone(timezone.utc).isoformat(),
-                    "text": msg.text
-                }
-
-                posts.append(post)
-                seen_ids.add(msg.id)
-
-                log.info(f"Найден прогноз: {dialog.name} | {msg.id}")
-
+            async for msg in client.iter_messages(entity, limit=MESSAGES_PER_CHAT):
+                text = msg.message or ""
+                if looks_hockey(text):
+                    results["matches"].append({
+                        "chat": title,
+                        "chat_id": getattr(entity, "id", None),
+                        "date": msg.date.isoformat() if msg.date else None,
+                        "message_id": msg.id,
+                        "text": text[:2000]
+                    })
         except FloodWaitError as e:
-            log.warning(f"FloodWait {e.seconds}s")
-            await asyncio.sleep(e.seconds)
+            log.warning(f"FloodWait {e.seconds}s on {title} — sleeping...")
+            await asyncio.sleep(e.seconds + 1)
         except Exception as e:
-            log.error(f"Ошибка в {dialog.name}: {e}")
+            log.warning(f"Skip chat {title}: {e}")
 
-    save_posts(posts)
-    log.info(f"Сохранено постов: {len(posts)}")
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
 
-# ================== ЦИКЛ ==================
+    log.info(f"Scan done. chats={results['chats_scanned']} matches={len(results['matches'])} -> {OUTPUT_JSON}")
+
+
 async def main():
-    if not API_ID or not API_HASH or not BOT_TOKEN:
-        raise RuntimeError("API_ID / API_HASH / BOT_TOKEN не заданы")
+    if API_ID == 0 or not API_HASH:
+        raise RuntimeError("Нет API_ID/API_HASH в Render Environment Variables")
 
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await client.start(bot_token=BOT_TOKEN)
+    ensure_session_file()
 
-    log.info("Telegram BOT запущен")
+    # ВАЖНО: используем user-session (SQLite session file)
+    client = TelegramClient(SESSION_BASENAME, API_ID, API_HASH)
 
+    await client.connect()
+
+    # Если нет авторизации — значит session не тот / не залит / не авторизован
+    if not await client.is_user_authorized():
+        raise RuntimeError(
+            "Сессия НЕ авторизована. Нужно залить правильный hockey_agent.session в Render Secret Files "
+            "и убедиться, что он был получен на компе после входа в аккаунт."
+        )
+
+    log.info("Telegram user-agent connected OK (session authorized)")
+
+    # цикл
     while True:
-        await scan(client)
-        await asyncio.sleep(DEFAULT_POLL_MINUTES * 60)
+        try:
+            await scan_once(client)
+        except Exception as e:
+            log.exception(f"Scan failed: {e}")
+        await asyncio.sleep(POLL_MINUTES * 60)
 
-# ================== START ==================
+
 if __name__ == "__main__":
     asyncio.run(main())
