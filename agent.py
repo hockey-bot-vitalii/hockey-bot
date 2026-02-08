@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RpcError
+from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
 
 
@@ -166,7 +166,7 @@ async def collect_once(client: TelegramClient, limit_per_chat: int):
         except FloodWaitError as e:
             logging.warning(f"FloodWait {e.seconds}s — сплю...")
             time.sleep(min(e.seconds, 120))
-        except RpcError as e:
+        except Exception as e:
             logging.warning(f"RPC error: {e}")
         except Exception as e:
             logging.exception(f"Ошибка чтения {title}: {e}")
